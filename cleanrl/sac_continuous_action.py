@@ -1,20 +1,29 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
+# This is updated to compat gymnasium (orginial compact gym)
 import argparse
 import os
 import random
 import time
 from distutils.util import strtobool
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from stable_baselines3.common.buffers import ReplayBuffer
+from torch.distributions.normal import Normal
+
 from torch.utils.tensorboard import SummaryWriter
 
+import stable_baselines3 as sb3
+if sb3.__version__ < "2.0":
+    raise ValueError(
+            """Ongoing migration: run the following command to install the new dependencies:
 
+poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-license]==0.28.1"  "ale-py==0.8.1" 
+""")
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
@@ -36,12 +45,14 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="Hopper-v4",
+    parser.add_argument("--env-id", type=str, default="HalfCheetah-v4",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
+    parser.add_argument("--num-envs", type=int, default=4,
+        help="the number of parallel game environments")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005,
@@ -69,20 +80,57 @@ def parse_args():
     return args
 
 
+# def make_env(env_id, seed, idx, capture_video, run_name):
+#     def thunk():
+#         env = gym.make(env_id)
+#         env = gym.wrappers.RecordEpisodeStatistics(env)
+#         if capture_video:
+#             if idx == 0:
+#                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+#         env.seed(seed)
+#         env.action_space.seed(seed)
+#         env.observation_space.seed(seed)
+#         return env
+
+#     return thunk
+# def make_env(env_id, idx, capture_video, run_name, gamma):
+#     def thunk():
+#         if capture_video:
+#             env = gym.make(env_id, render_mode="rgb_array")
+#         else:
+#             env = gym.make(env_id)
+#         env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
+#         env = gym.wrappers.RecordEpisodeStatistics(env)
+#         if capture_video:
+#             if idx == 0:
+#                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+#         env = gym.wrappers.ClipAction(env)
+#         env = gym.wrappers.NormalizeObservation(env)
+#         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+#         env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+#         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+#         return env
+
+#     return thunk
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
-        env = gym.make(env_id)
+        if capture_video:
+            env = gym.make(env_id, render_mode="rgb_array")
+        else:
+            env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
             if idx == 0:
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env.seed(seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
 
     return thunk
 
+def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
+    slope = (end_e - start_e) / duration
+    return max(slope * t + start_e, end_e)
 
 # ALGO LOGIC: initialize agent here:
 class SoftQNetwork(nn.Module):
@@ -93,6 +141,7 @@ class SoftQNetwork(nn.Module):
         self.fc3 = nn.Linear(256, 1)
 
     def forward(self, x, a):
+        # x = x.float()
         x = torch.cat([x, a], 1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
@@ -174,11 +223,18 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
+    # env setup
+    # envs = gym.vector.SyncVectorEnv(
+    #     [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
+    # )
+    # envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name, args.gamma)])
+    # envs = gym.vector.SyncVectorEnv(
+    #     [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
+    # )
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
-
     actor = Actor(envs).to(device)
     qf1 = SoftQNetwork(envs).to(device)
     qf2 = SoftQNetwork(envs).to(device)
@@ -186,10 +242,10 @@ if __name__ == "__main__":
     qf2_target = SoftQNetwork(envs).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
+    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr,eps=1e-4)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
-    # Automatic entropy tuning
+    # Automatic entropy tuning diff
     if args.autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
@@ -204,37 +260,42 @@ if __name__ == "__main__":
         envs.single_observation_space,
         envs.single_action_space,
         device,
-        handle_timeout_termination=True,
+        optimize_memory_usage=True,
+        handle_timeout_termination=False,
     )
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
-    obs = envs.reset()
+    obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
-            actions = actions.detach().cpu().numpy()
+            with torch.no_grad():
+                actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+                # actions = actions.detach().cpu().numpy()
+                #change(clip)
+                actions = actions.cpu().numpy().clip(envs.single_action_space.low, envs.single_action_space.high)
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, dones, infos = envs.step(actions)
+        next_obs, rewards, terminateds, truncateds, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        for info in infos:
-            if "episode" in info.keys():
+        if "final_info" in infos:
+            for info in infos["final_info"]:
                 print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                 break
 
+
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
-        for idx, d in enumerate(dones):
+        for idx, d in enumerate(truncateds):
             if d:
-                real_next_obs[idx] = infos[idx]["terminal_observation"]
-        rb.add(obs, real_next_obs, actions, rewards, dones, infos)
+                real_next_obs[idx] = infos["final_observation"][idx]
+        rb.add(obs, real_next_obs, actions, rewards, terminateds, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -266,8 +327,9 @@ if __name__ == "__main__":
                     pi, log_pi, _ = actor.get_action(data.observations)
                     qf1_pi = qf1(data.observations, pi)
                     qf2_pi = qf2(data.observations, pi)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
+                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+
 
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
